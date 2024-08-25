@@ -49,6 +49,38 @@ type Dump struct {
 	Accounts map[string]DumpAccount `json:"accounts"`
 }
 
+func (self *StateDB) DumpContractStorage(address common.Address) map[string]string {
+	res := map[string]string{}
+
+	obj := self.getStateObject(address)
+	trie := obj.getStorageTrie(self.db)
+	it := statedb.NewIterator(trie.NodeIterator(nil))
+	for it.Next() {
+		key := common.Bytes2Hex(trie.GetKey(it.Key))
+		if key == "" {
+			key = "hash:" + common.Bytes2Hex(it.Key)
+		}
+		res[key] = common.Bytes2Hex(it.Value)
+	}
+
+	return res
+}
+
+// GetStates retrieves values from the given account's storage trie.
+func (self *StateDB) GetStates(addr common.Address, hashes []common.Hash) map[common.Hash]common.Hash {
+	states := map[common.Hash]common.Hash{}
+	stateObject := self.getStateObject(addr)
+	if stateObject != nil {
+		for _, hash := range hashes {
+			state := stateObject.GetState(self.db, hash)
+			if !common.EmptyHash(state) {
+				states[hash] = state
+			}
+		}
+	}
+	return states
+}
+
 func (self *StateDB) RawDump() Dump {
 	dump := Dump{
 		Root:     fmt.Sprintf("%x", self.trie.Hash()),

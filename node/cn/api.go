@@ -285,6 +285,27 @@ func NewPublicDebugAPI(cn *CN) *PublicDebugAPI {
 	return &PublicDebugAPI{cn: cn}
 }
 
+// DumpContractStorage retrieves the entire storage (key-value) of
+// the contracts with given addresses at a given block.
+func (api *PublicDebugAPI) DumpContractStorage(ctx context.Context, addresses []common.Address, blockNumberOrHash rpc.BlockNumberOrHash) (map[string]map[string]string, error) {
+	block, err := api.cn.APIBackend.BlockByNumberOrHash(ctx, blockNumberOrHash)
+	if err != nil {
+		return nil, err
+	}
+
+	stateDB, err := api.cn.BlockChain().StateAt(block.Root())
+	if err != nil {
+		return nil, err
+	}
+
+	res := map[string]map[string]string{}
+	for _, address := range addresses {
+		res[address.String()] = stateDB.DumpContractStorage(address)
+	}
+
+	return res, nil
+}
+
 // DumpBlock retrieves the entire state of the database at a given block.
 func (api *PublicDebugAPI) DumpBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (state.Dump, error) {
 	if *blockNrOrHash.BlockNumber == rpc.PendingBlockNumber {
