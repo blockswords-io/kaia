@@ -112,6 +112,16 @@ type StateDB struct {
 
 	prefetching bool
 
+	// blockswords: buffers committed storage writes for watched contracts so
+	// they can be published at Commit. nil unless the storage watch is active
+	// for at least one watched address. See storagewatch_blockswords.go.
+	blockswordsStorageWatch *blockswordsStorageWatchBuffer
+
+	// blockswords: buffers committed account-level changes (balance/nonce/code/
+	// storage root) for watched addresses. nil unless the account watch is
+	// active. See accountwatch_blockswords.go.
+	blockswordsAccountWatch *blockswordsAccountWatchBuffer
+
 	// Measurements gathered during execution for debugging purposes
 	AccountReads         time.Duration
 	AccountHashes        time.Duration
@@ -1161,6 +1171,9 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (root common.Hash, err error) 
 	// Commit objects to the trie.
 	for addr, stateObject := range s.stateObjects {
 		_, isDirty := s.stateObjectsDirty[addr]
+		if isDirty || stateObject.selfDestructed {
+			s.blockswordsCaptureAccountChange(addr) // blockswords: account-level watch
+		}
 		switch {
 		case stateObject.selfDestructed || (isDirty && deleteEmptyObjects && stateObject.empty()):
 			// If the object has been removed, don't bother syncing it
@@ -1227,6 +1240,8 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (root common.Hash, err error) 
 		}
 		s.snap, s.snapDestructs, s.snapAccounts, s.snapStorage = nil, nil, nil, nil
 	}
+	s.blockswordsPublishStorageWrites(root)  // blockswords: storage-write watch
+	s.blockswordsPublishAccountChanges(root) // blockswords: account-level watch
 	return root, err
 }
 

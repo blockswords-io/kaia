@@ -353,6 +353,7 @@ func (s *stateObject) updateStorageTrie(db Database) Trie {
 		if value == s.originStorage[key] {
 			continue
 		}
+		s.db.blockswordsCaptureStorageWrite(s.address, key, s.originStorage[key], value) // blockswords: storage-write watch
 		s.originStorage[key] = value
 
 		var v []byte

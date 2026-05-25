@@ -27,6 +27,7 @@ import (
 	"math/big"
 	"sync"
 
+	"github.com/kaiachain/kaia/blockchain/types"
 	"github.com/kaiachain/kaia/blockchain/vm"
 	"github.com/kaiachain/kaia/common"
 	"github.com/kaiachain/kaia/common/hexutil"
@@ -153,4 +154,81 @@ func (s *KaiaBlockChainAPI) EstimateGasWithTrace(ctx context.Context, args CallA
 	}
 
 	return &EstimateGasTraceResult{Gas: estimatedGas}, nil
+}
+
+// CallWithAccessedStorageResult is the result of CallWithAccessedStorage: the
+// call's return data plus the access list (addresses and storage slots) the EVM
+// read or wrote during execution.
+//
+// AccessList tuples that carry storage keys identify the contracts — and the
+// specific slots — whose storage this call depends on. They can be fed directly
+// into kaia_subscribe("storageChanges") to invalidate this call's cached result
+// when its inputs change: use the tuple addresses for contract-granularity
+// watching, or the tuple storage keys for slot-granularity watching.
+type CallWithAccessedStorageResult struct {
+	// Return is the call's return data (empty if the call reverted or errored).
+	Return hexutil.Bytes `json:"return"`
+	// GasUsed is the gas consumed by the call.
+	GasUsed hexutil.Uint64 `json:"gasUsed"`
+	// AccessList is the set of addresses and storage slots the call touched
+	// (read or wrote), in EIP-2930 form. It is returned even when the call
+	// reverts, reflecting the slots touched up to the point of revert.
+	AccessList types.AccessList `json:"accessList"`
+	// BalanceAddresses are the addresses whose balance the call read
+	// (BALANCE/SELFBALANCE). Balances change outside the storage trie, so to
+	// keep this call's result live these must be watched at account granularity.
+	BalanceAddresses []common.Address `json:"balanceAddresses,omitempty"`
+	// BlockContext lists the block-context opcodes the call used (e.g.
+	// TIMESTAMP, NUMBER, BASEFEE). When non-empty the result may change every
+	// block independently of state, so it cannot be tracked by watching state.
+	BlockContext []string `json:"blockContext,omitempty"`
+	// Trackable is true iff the result is a pure function of tracked state
+	// (storage + balances) — i.e. BlockContext is empty. A reactive ("live")
+	// subscription on this call is only sound when Trackable is true.
+	Trackable bool `json:"trackable"`
+	// Error is the raw VM error (e.g. "execution reverted"), if any.
+	Error string `json:"error,omitempty"`
+}
+
+// CallWithAccessedStorage executes args exactly like kaia_call but, in addition
+// to the return data, reports every (contract address, storage slot) the EVM
+// read or wrote during the call. It is the discovery counterpart to
+// kaia_subscribe("storageChanges"): run this once to learn which storage a call
+// depends on, then watch those contracts/slots.
+//
+// NOTE: This method is an unofficial, blockswords fork only method.
+func (s *KaiaBlockChainAPI) CallWithAccessedStorage(ctx context.Context, args CallArgs, blockNrOrHash rpc.BlockNumberOrHash) (*CallWithAccessedStorageResult, error) {
+	gasCap := big.NewInt(0)
+	if rpcGasCap := s.b.RPCGasCap(); rpcGasCap != nil {
+		gasCap = rpcGasCap
+	}
+
+	// A single execution with the dependency tracer is enough to record the
+	// touched (address, slot) set, the balance reads, and any block-context
+	// reads; unlike eth_createAccessList we do not iterate to a gas fixpoint
+	// because we only care about what the call depends on.
+	tracer := vm.NewBlockswordsCallDependencyTracer(nil)
+	vmCfg := vm.Config{
+		Debug:                true,
+		Tracer:               tracer,
+		ComputationCostLimit: params.OpcodeComputationCostLimitInfinite,
+		UseConsoleLog:        s.b.IsConsoleLogEnabled(),
+	}
+	result, _, err := DoCall(ctx, s.b, args, blockNrOrHash, vmCfg, s.b.RPCEVMTimeout(), gasCap)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &CallWithAccessedStorageResult{
+		Return:           result.Return(),
+		GasUsed:          hexutil.Uint64(result.UsedGas),
+		AccessList:       tracer.AccessList(),
+		BalanceAddresses: tracer.BalanceAddresses(),
+		BlockContext:     tracer.BlockContextOpcodes(),
+		Trackable:        tracer.Trackable(),
+	}
+	if vmErr := result.Unwrap(); vmErr != nil {
+		res.Error = vmErr.Error()
+	}
+	return res, nil
 }
