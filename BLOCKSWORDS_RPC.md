@@ -360,8 +360,14 @@ the built-in RPC mechanism and works under whichever namespace you subscribed
 ```
 
 **Closing the WebSocket/IPC connection automatically unsubscribes everything on
-it** — server-side resources (goroutines, watch-list entries) are released. A
-dropped client leaks nothing.
+it** — server-side resources (the per-subscription goroutine and watch-list
+entries) are released. A cleanly disconnected client leaks nothing. A client that
+**hangs** (connection alive but not reading) is also released: a notification write
+that exceeds the write deadline (default 10s) tears the subscription down. For a
+client that is stuck but neither reading nor closing the socket, enable the
+WebSocket **read** deadline (`--wsreaddeadline`, disabled by default) so the
+connection is detected and closed; the per-node `callResults` cap (1024) bounds the
+blast radius regardless.
 
 ### Listing
 

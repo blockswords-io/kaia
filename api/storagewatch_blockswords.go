@@ -133,7 +133,17 @@ func (s *KaiaBlockChainAPI) StorageChanges(ctx context.Context, filters []Storag
 		for {
 			select {
 			case notification := <-sub.ch:
-				notifier.Notify(rpcSub.ID, notification)
+				// A failed notification write means the client connection is broken or
+				// has not read within the write-deadline window (default 10s). Tear down
+				// immediately so the subscription's watch-list entries (and, when it is
+				// the last subscription, the shared capture loop) are released promptly —
+				// without waiting for the read side to error, which for a hung (as opposed
+				// to cleanly disconnected) client may never happen, since the WebSocket
+				// read deadline is disabled by default. The client can resubscribe.
+				if err := notifier.Notify(rpcSub.ID, notification); err != nil {
+					mgr.unsubscribe(sub)
+					return
+				}
 			case <-rpcSub.Err():
 				mgr.unsubscribe(sub)
 				return

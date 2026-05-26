@@ -232,7 +232,20 @@ func (s *KaiaBlockChainAPI) CallResults(ctx context.Context, args CallArgs) (*rp
 		for {
 			select {
 			case notification := <-sub.out:
-				notifier.Notify(rpcSub.ID, notification)
+				// A failed notification write means the client connection is broken or
+				// has not read within the write-deadline window (default 10s). Tear down
+				// immediately so the per-block EVM re-evaluation goroutine and the
+				// watch-list entries are released promptly — without waiting for the read
+				// side to error, which for a hung (as opposed to cleanly disconnected)
+				// client may never happen, since the WebSocket read deadline is disabled
+				// by default. The client can resubscribe; a live-results stream already
+				// tolerates gaps. Normal back-pressure does NOT reach here: the eval
+				// goroutine drops into a full buffer (non-blocking emit), so writes only
+				// fail when the consumer has genuinely stalled.
+				if err := notifier.Notify(rpcSub.ID, notification); err != nil {
+					mgr.unsubscribe(sub)
+					return
+				}
 			case <-rpcSub.Err():
 				mgr.unsubscribe(sub)
 				return

@@ -468,6 +468,51 @@ func TestReactiveCallUnsubscribeClearsWatchlist(t *testing.T) {
 	assert.Error(t, sub.ctx.Err(), "subscription context must be cancelled")
 }
 
+// TestReactiveCallUnsubscribeStopsEvaluation verifies the per-subscription eval
+// goroutine stops doing work after teardown: no further evaluations occur even when
+// new head events and dependency changes arrive. This is the anti-leak property for
+// the engine's heaviest per-subscription resource (the per-block EVM re-evaluation
+// goroutine) — on a disconnect/hang the goroutine and its watch-list entries are
+// released, not left re-evaluating forever.
+func TestReactiveCallUnsubscribeStopsEvaluation(t *testing.T) {
+	defer state.SetBlockswordsAccountWatchlist(nil)
+	dep := common.HexToAddress("0xc0ffee")
+
+	var mu sync.Mutex
+	evalCount := 0
+	eval := func(ctx context.Context, args CallArgs, blockNum uint64) (*reactiveEvalResult, error) {
+		mu.Lock()
+		evalCount++
+		mu.Unlock()
+		return &reactiveEvalResult{returnData: []byte("v"), deps: addrSet(dep), trackable: true}, nil
+	}
+	m, be := newReactiveTestManager(t, eval)
+	be.setHead(blockWithRoot(1, common.HexToHash("0x1")))
+
+	sub := mustSubscribe(t, m, CallArgs{}, "stop")
+	recvReactive(t, sub) // snapshot
+
+	m.unsubscribe(sub)
+	require.Error(t, sub.ctx.Err(), "ctx must be cancelled")
+	mu.Lock()
+	countAtUnsub := evalCount
+	mu.Unlock()
+
+	// Drive several blocks with dependency changes; a live eval goroutine would
+	// re-evaluate (the dep is/was watched). A torn-down one must not.
+	for i := int64(2); i < 6; i++ {
+		root := commitAccountChange(t, dep, i)
+		be.setHead(blockWithRoot(uint64(i), root))
+		be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(uint64(i), root)})
+	}
+	time.Sleep(300 * time.Millisecond) // give any erroneous re-evaluation time to run
+
+	mu.Lock()
+	finalCount := evalCount
+	mu.Unlock()
+	assert.Equal(t, countAtUnsub, finalCount, "no evaluation may occur after unsubscribe")
+}
+
 // commitAndLookup commits a balance change to addr and returns the account
 // changes captured for the resulting root.
 func commitAndLookup(t *testing.T, addr common.Address, salt int64) []common.Address {
