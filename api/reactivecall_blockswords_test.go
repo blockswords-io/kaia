@@ -205,6 +205,139 @@ func TestReactiveCallUntrackableWarns(t *testing.T) {
 	assert.Contains(t, snap.BlockContext, "TIMESTAMP")
 }
 
+// TestReactiveCallBlockContextReevaluatesEveryBlock verifies a block-context
+// call (Trackable=false) is re-evaluated on EVERY block — even one with no
+// watched dependency change — so a result that drifts with block context (e.g. a
+// TIMESTAMP-derived value) still emits updates, and is deduped when unchanged.
+// This is the completeness guarantee: callResults emits whenever the result
+// actually changes, never only on state changes.
+func TestReactiveCallBlockContextReevaluatesEveryBlock(t *testing.T) {
+	defer state.SetBlockswordsAccountWatchlist(nil)
+	dep := common.HexToAddress("0xb10c")
+
+	var mu sync.Mutex
+	// The result drifts at block 61, then holds at 62. No account changes are
+	// committed for these blocks (their roots have no captured changes), so only
+	// the block-context path — not a dependency change — can trigger re-eval.
+	results := map[uint64]string{60: "t60", 61: "t61", 62: "t61"}
+	m, be := newReactiveTestManager(t, staticEval(&mu, results, addrSet(dep), false, []string{"TIMESTAMP"}))
+
+	be.setHead(blockWithRoot(60, common.HexToHash("0x60")))
+	sub := mustSubscribe(t, m, CallArgs{}, "bctx")
+	defer m.unsubscribe(sub)
+
+	snap := recvReactive(t, sub)
+	assert.Equal(t, reactiveCallSnapshot, snap.Type)
+	assert.Equal(t, "t60", string(snap.Result))
+	require.NotNil(t, snap.Trackable)
+	assert.False(t, *snap.Trackable)
+
+	// A changeless block (no account change captured for its root) still
+	// re-evaluates the block-context call, so the drifted result is emitted.
+	be.setHead(blockWithRoot(61, common.HexToHash("0x61")))
+	be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(61, common.HexToHash("0x61"))})
+
+	upd := recvReactive(t, sub)
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.EqualValues(t, 1, upd.Seq)
+	assert.EqualValues(t, 61, upd.BlockNumber)
+	assert.Equal(t, "t61", string(upd.Result))
+
+	// Another changeless block where the result holds -> re-evaluated but deduped.
+	be.setHead(blockWithRoot(62, common.HexToHash("0x62")))
+	be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(62, common.HexToHash("0x62"))})
+
+	assertNoReactive(t, sub)
+}
+
+// TestReactiveCallPublishRedeliversDroppedUpdate verifies that when the delivery
+// buffer is full, publish does NOT advance the dedup state (lastHash/seq) — so a
+// dropped update is re-pushed rather than silently skipped once the consumer
+// drains, and the subscription is marked needsReeval so the head loop keeps
+// re-attempting it.
+func TestReactiveCallPublishRedeliversDroppedUpdate(t *testing.T) {
+	sub := &reactiveCallSubscription{out: make(chan *CallResultNotification, 1)}
+	sub.anchored.Store(true)
+	sub.lastHash = reactiveResultHash([]byte("A"), "") // last delivered result was "A"
+
+	head := blockWithRoot(10, common.HexToHash("0x10"))
+	resB := &reactiveEvalResult{returnData: []byte("B"), trackable: true}
+
+	// Fill the buffer so the next emit drops.
+	sub.out <- &CallResultNotification{}
+
+	sub.publish(head, resB)
+	assert.True(t, sub.needsReeval.Load(), "a dropped update must arm needsReeval")
+	assert.Equal(t, reactiveResultHash([]byte("A"), ""), sub.lastHash, "lastHash must NOT advance on a dropped update")
+	assert.EqualValues(t, 0, sub.seq, "seq must NOT advance on a dropped update")
+
+	// Drain; re-publishing the still-current result now delivers it, advances the
+	// dedup state, and clears needsReeval.
+	<-sub.out
+	sub.publish(head, resB)
+	upd := <-sub.out
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.Equal(t, "B", string(upd.Result))
+	assert.EqualValues(t, 1, upd.Seq)
+	assert.False(t, sub.needsReeval.Load(), "needsReeval must clear once delivered")
+}
+
+// TestReactiveCallPublishDroppedSnapshotStaysUnanchored verifies that when the
+// initial snapshot send is dropped (consumer buffer full), publish does NOT anchor
+// the subscription — so the head loop keeps re-attempting it (via !anchored) until
+// the snapshot lands, rather than advancing to updates the client never got a
+// baseline for.
+func TestReactiveCallPublishDroppedSnapshotStaysUnanchored(t *testing.T) {
+	sub := &reactiveCallSubscription{out: make(chan *CallResultNotification, 1)}
+	head := blockWithRoot(7, common.HexToHash("0x7"))
+	resA := &reactiveEvalResult{returnData: []byte("A"), trackable: true}
+
+	// Fill the buffer so the snapshot send drops.
+	sub.out <- &CallResultNotification{}
+
+	sub.publish(head, resA)
+	assert.False(t, sub.anchored.Load(), "a dropped snapshot must NOT anchor")
+	assert.Equal(t, common.Hash{}, sub.lastHash, "lastHash must NOT advance on a dropped snapshot")
+
+	// Drain; re-publishing now delivers the snapshot and anchors.
+	<-sub.out
+	sub.publish(head, resA)
+	snap := <-sub.out
+	assert.Equal(t, reactiveCallSnapshot, snap.Type)
+	assert.Equal(t, "A", string(snap.Result))
+	assert.True(t, sub.anchored.Load(), "snapshot delivery must anchor")
+}
+
+// TestReactiveCallDropCoalescesToLatestOutcome verifies that when a send is dropped
+// (needsReeval armed, dedup state not advanced) and the outcome then CHANGES (here
+// success -> revert), the engine converges to the LATEST outcome once the consumer
+// drains — the intermediate dropped value is not redelivered, the current one is.
+func TestReactiveCallDropCoalescesToLatestOutcome(t *testing.T) {
+	sub := &reactiveCallSubscription{out: make(chan *CallResultNotification, 1)}
+	sub.anchored.Store(true)
+	sub.lastHash = reactiveResultHash([]byte("A"), "") // last delivered outcome
+
+	head := blockWithRoot(10, common.HexToHash("0x10"))
+
+	// Fill the buffer; publishing "B" drops (needsReeval armed, dedup state held).
+	sub.out <- &CallResultNotification{}
+	sub.publish(head, &reactiveEvalResult{returnData: []byte("B"), trackable: true})
+	assert.True(t, sub.needsReeval.Load(), "a dropped update arms needsReeval")
+	assert.Equal(t, reactiveResultHash([]byte("A"), ""), sub.lastHash, "dedup state must not advance on a drop")
+
+	// The outcome changes to a revert before the consumer drains. Drain, then publish
+	// the CURRENT outcome (the revert): it is delivered as the update, superseding
+	// the dropped "B" (which is never redelivered).
+	<-sub.out
+	sub.publish(head, &reactiveEvalResult{vmErr: "execution reverted", trackable: true})
+	upd := <-sub.out
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.Empty(t, upd.Result)
+	assert.Equal(t, "execution reverted", upd.Error)
+	assert.EqualValues(t, 1, upd.Seq)
+	assert.False(t, sub.needsReeval.Load(), "needsReeval clears once the latest outcome is delivered")
+}
+
 // TestReactiveCallDynamicDeps verifies the engine re-arms when a re-evaluation
 // reveals a new dependency, so a change to the new dependency triggers updates.
 func TestReactiveCallDynamicDeps(t *testing.T) {
@@ -391,7 +524,7 @@ func TestReactiveCallBackendErrorSurfacesAndRecovers(t *testing.T) {
 	defer m.unsubscribe(sub)
 
 	errSnap := recvReactive(t, sub)
-	assert.Equal(t, reactiveCallSnapshot, errSnap.Type)
+	assert.Equal(t, reactiveCallError, errSnap.Type)
 	assert.Equal(t, "state unavailable", errSnap.Error)
 	assert.Empty(t, errSnap.Result)
 
@@ -445,4 +578,229 @@ func TestReactiveCallMonotonicDeps(t *testing.T) {
 	recvReactive(t, sub)
 
 	assert.Contains(t, sub.loadDeps(), depB, "conditionally-dropped dependency must stay watched")
+}
+
+// TestReactiveCallEmitsOnRevertTransitions verifies a revert is a first-class
+// outcome: a success<->revert transition is emitted (so a client can react to a
+// call that starts or stops failing), while a stable outcome (the same value, or
+// still reverting with the same error) is deduped.
+func TestReactiveCallEmitsOnRevertTransitions(t *testing.T) {
+	sub := &reactiveCallSubscription{out: make(chan *CallResultNotification, 8)}
+	head := blockWithRoot(5, common.HexToHash("0x5"))
+	success := func(v string) *reactiveEvalResult {
+		return &reactiveEvalResult{returnData: []byte(v), trackable: true}
+	}
+	revert := func() *reactiveEvalResult {
+		return &reactiveEvalResult{vmErr: "execution reverted", trackable: true}
+	}
+	drain := func() *CallResultNotification {
+		select {
+		case n := <-sub.out:
+			return n
+		default:
+			return nil
+		}
+	}
+
+	// Snapshot: success "A".
+	sub.publish(head, success("A"))
+	snap := drain()
+	require.NotNil(t, snap)
+	assert.Equal(t, reactiveCallSnapshot, snap.Type)
+	assert.Equal(t, "A", string(snap.Result))
+	assert.Empty(t, snap.Error)
+
+	// success -> revert: emitted as an update (Error set, empty Result).
+	sub.publish(head, revert())
+	upd := drain()
+	require.NotNil(t, upd)
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.EqualValues(t, 1, upd.Seq)
+	assert.Empty(t, upd.Result)
+	assert.Equal(t, "execution reverted", upd.Error)
+
+	// Still reverting (same error) -> deduped.
+	sub.publish(head, revert())
+	assert.Nil(t, drain(), "a stable revert must be deduped")
+
+	// revert -> success "A": emitted (the call recovered).
+	sub.publish(head, success("A"))
+	rec := drain()
+	require.NotNil(t, rec)
+	assert.Equal(t, reactiveCallUpdate, rec.Type)
+	assert.EqualValues(t, 2, rec.Seq)
+	assert.Equal(t, "A", string(rec.Result))
+	assert.Empty(t, rec.Error)
+
+	// Same success value -> deduped.
+	sub.publish(head, success("A"))
+	assert.Nil(t, drain(), "an unchanged value must be deduped")
+}
+
+// TestReactiveCallInitialRevertAnchorsAsSnapshot verifies that when the FIRST
+// evaluated outcome is a revert, it anchors as the snapshot (with Error set) — a
+// revert is a valid current outcome — and a later success is emitted as an update.
+func TestReactiveCallInitialRevertAnchorsAsSnapshot(t *testing.T) {
+	sub := &reactiveCallSubscription{out: make(chan *CallResultNotification, 4)}
+	head := blockWithRoot(5, common.HexToHash("0x5"))
+	drain := func() *CallResultNotification {
+		select {
+		case n := <-sub.out:
+			return n
+		default:
+			return nil
+		}
+	}
+
+	// First outcome is a revert: snapshot with Error, anchored.
+	sub.publish(head, &reactiveEvalResult{vmErr: "execution reverted", trackable: true})
+	snap := drain()
+	require.NotNil(t, snap)
+	assert.Equal(t, reactiveCallSnapshot, snap.Type)
+	assert.Equal(t, "execution reverted", snap.Error)
+	assert.Empty(t, snap.Result)
+	assert.True(t, sub.anchored.Load(), "a revert outcome anchors the subscription")
+
+	// First success -> update.
+	sub.publish(head, &reactiveEvalResult{returnData: []byte("ok"), trackable: true})
+	upd := drain()
+	require.NotNil(t, upd)
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.EqualValues(t, 1, upd.Seq)
+	assert.Equal(t, "ok", string(upd.Result))
+	assert.Empty(t, upd.Error)
+}
+
+// TestReactiveCallInfraErrorThenRevertAnchors verifies the infra-error vs revert
+// boundary: a backend evaluation error (the node could not run the call) surfaces
+// the one-time "error" message and does NOT anchor; and if the first EVALUABLE
+// outcome is then a revert, that revert anchors as the snapshot (errorReported
+// gates only the "error" message, never the snapshot).
+func TestReactiveCallInfraErrorThenRevertAnchors(t *testing.T) {
+	sub := &reactiveCallSubscription{out: make(chan *CallResultNotification, 4)}
+	sub.ctx, sub.cancel = context.WithCancel(context.Background())
+	defer sub.cancel()
+	head := blockWithRoot(5, common.HexToHash("0x5"))
+	drain := func() *CallResultNotification {
+		select {
+		case n := <-sub.out:
+			return n
+		default:
+			return nil
+		}
+	}
+
+	// Backend eval error: one-time "error" message, not anchored.
+	sub.handleEvalError(head, errors.New("state unavailable"))
+	first := drain()
+	require.NotNil(t, first)
+	assert.Equal(t, reactiveCallError, first.Type)
+	assert.Equal(t, "state unavailable", first.Error)
+	assert.False(t, sub.anchored.Load(), "an infra error must not anchor")
+
+	// The first evaluable outcome is a revert: it anchors as the snapshot.
+	sub.publish(head, &reactiveEvalResult{vmErr: "execution reverted", trackable: true})
+	snap := drain()
+	require.NotNil(t, snap)
+	assert.Equal(t, reactiveCallSnapshot, snap.Type)
+	assert.Equal(t, "execution reverted", snap.Error)
+	assert.Empty(t, snap.Result)
+	assert.True(t, sub.anchored.Load(), "a revert outcome anchors even after an infra error")
+}
+
+// TestReactiveCallRetriesAfterAnchoredEvalError verifies that when an evaluation
+// errors AFTER the subscription is anchored, the head loop keeps re-signaling it
+// (needsReeval) so a result change whose evaluation transiently failed is still
+// delivered — even on a later block with no dependency change, which otherwise
+// would not re-signal an anchored, state-pure subscription.
+func TestReactiveCallRetriesAfterAnchoredEvalError(t *testing.T) {
+	defer state.SetBlockswordsAccountWatchlist(nil)
+	dep := common.HexToAddress("0xa11")
+
+	var mu sync.Mutex
+	phase := 0 // 0 => ok "v1", 1 => transient error, 2 => ok "v2"
+	eval := func(ctx context.Context, args CallArgs, blockNum uint64) (*reactiveEvalResult, error) {
+		mu.Lock()
+		p := phase
+		mu.Unlock()
+		switch p {
+		case 1:
+			return nil, errors.New("eval timeout")
+		case 2:
+			return &reactiveEvalResult{returnData: []byte("v2"), deps: addrSet(dep), trackable: true}, nil
+		default:
+			return &reactiveEvalResult{returnData: []byte("v1"), deps: addrSet(dep), trackable: true}, nil
+		}
+	}
+	m, be := newReactiveTestManager(t, eval)
+
+	be.setHead(blockWithRoot(1, common.HexToHash("0x1")))
+	sub := mustSubscribe(t, m, CallArgs{}, "retry")
+	defer m.unsubscribe(sub)
+
+	snap := recvReactive(t, sub)
+	assert.Equal(t, "v1", string(snap.Result))
+
+	// Block 2: a dep change triggers a re-eval, but the eval errors -> no emit,
+	// needsReeval armed.
+	mu.Lock()
+	phase = 1
+	mu.Unlock()
+	root2 := commitAccountChange(t, dep, 2)
+	be.setHead(blockWithRoot(2, root2))
+	be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(2, root2)})
+	assertNoReactive(t, sub)
+
+	// Block 3: a changeless block (no captured account change). Only needsReeval
+	// can re-signal the anchored, state-pure subscription; the eval recovers and
+	// the changed result is delivered.
+	mu.Lock()
+	phase = 2
+	mu.Unlock()
+	be.setHead(blockWithRoot(3, common.HexToHash("0x3")))
+	be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(3, common.HexToHash("0x3"))})
+
+	upd := recvReactive(t, sub)
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.Equal(t, "v2", string(upd.Result))
+}
+
+// TestReactiveCallReevaluatesOnHeadJump verifies that when the head advances by
+// more than one block (a batch insert emits a single ChainHeadEvent for the last
+// block), every subscription is re-evaluated — so a result change in a skipped
+// block is not missed even though only the final block's account changes are
+// joined. Uses an empty dependency set so the ONLY thing that can trigger a
+// re-evaluation is the head jump (no dep change, no block context, no pending
+// retry — the initial snapshot does not grow an empty set).
+func TestReactiveCallReevaluatesOnHeadJump(t *testing.T) {
+	defer state.SetBlockswordsAccountWatchlist(nil)
+
+	var mu sync.Mutex
+	// Block 4 is never evaluated; the head jumps 2 -> 4 (skipping 3).
+	results := map[uint64]string{1: "v1", 4: "v4"}
+	m, be := newReactiveTestManager(t, staticEval(&mu, results, nil, true, nil))
+
+	be.setHead(blockWithRoot(1, common.HexToHash("0x1")))
+	sub := mustSubscribe(t, m, CallArgs{}, "jump")
+	defer m.unsubscribe(sub)
+
+	snap := recvReactive(t, sub)
+	assert.Equal(t, "v1", string(snap.Result))
+	require.False(t, sub.needsReeval.Load(), "an empty dependency set must not arm the arming-window retry")
+
+	// A first (contiguous) head event establishes lastDispatched; an empty-dep,
+	// state-pure, anchored subscription is not signaled, so nothing is emitted.
+	be.setHead(blockWithRoot(2, common.HexToHash("0x2")))
+	be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(2, common.HexToHash("0x2"))})
+	assertNoReactive(t, sub)
+
+	// The head now jumps 2 -> 4 (block 3 skipped). The jump alone forces a re-eval,
+	// surfacing the changed result.
+	be.setHead(blockWithRoot(4, common.HexToHash("0x4")))
+	be.feed.Send(blockchain.ChainHeadEvent{Block: blockWithRoot(4, common.HexToHash("0x4"))})
+
+	upd := recvReactive(t, sub)
+	assert.Equal(t, reactiveCallUpdate, upd.Type)
+	assert.EqualValues(t, 1, upd.Seq)
+	assert.Equal(t, "v4", string(upd.Result))
 }

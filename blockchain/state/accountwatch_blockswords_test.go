@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/kaiachain/kaia/common"
+	"github.com/kaiachain/kaia/params"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,6 +54,29 @@ func TestBlockswordsAccountWatchStorageImpliesAccount(t *testing.T) {
 
 	st := newTestStateDB(t)
 	st.SetState(watched, common.HexToHash("0x01"), common.HexToHash("0x02"))
+
+	root, err := st.Commit(false)
+	require.NoError(t, err)
+
+	changed := LookupBlockswordsAccountChanges(root)
+	require.Len(t, changed, 1)
+	assert.Equal(t, watched, changed[0])
+}
+
+// A code change (a first deployment, or an EIP-7702 (re)delegation) dirties the
+// account, so account-level capture fires for it too. This is why a callResults
+// dependency whose code/existence the call reads (EXTCODESIZE/EXTCODEHASH/
+// EXTCODECOPY, or a CALL target) is re-evaluated when that code changes —
+// account-granularity watching covers code without a separate code watch-list,
+// even though deployed runtime code is otherwise immutable.
+func TestBlockswordsAccountWatchCodeChange(t *testing.T) {
+	watched := common.HexToAddress("0x5555")
+	defer SetBlockswordsAccountWatchlist(nil)
+	SetBlockswordsAccountWatchlist([]common.Address{watched})
+
+	st := newTestStateDB(t)
+	st.CreateSmartContractAccount(watched, params.CodeFormatEVM, params.Rules{})
+	require.NoError(t, st.SetCode(watched, []byte{0x60, 0x00})) // PUSH1 0
 
 	root, err := st.Commit(false)
 	require.NoError(t, err)

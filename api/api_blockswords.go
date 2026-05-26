@@ -175,17 +175,48 @@ type CallWithAccessedStorageResult struct {
 	// reverts, reflecting the slots touched up to the point of revert.
 	AccessList types.AccessList `json:"accessList"`
 	// BalanceAddresses are the addresses whose balance the call read
-	// (BALANCE/SELFBALANCE). Balances change outside the storage trie, so to
-	// keep this call's result live these must be watched at account granularity.
+	// (BALANCE/SELFBALANCE). Balances change outside the storage trie, so a
+	// non-empty list means watching AccessList via kaia_subscribe(
+	// "storageChanges") is NOT enough to keep this result live (Trackable is
+	// false): a balance can drift every block with no storage write. Watch these
+	// at account granularity instead — kaia_subscribe("callResults") does this —
+	// or poll.
 	BalanceAddresses []common.Address `json:"balanceAddresses,omitempty"`
+	// CodeAddresses are the addresses whose code or existence the call depends on:
+	// those read via EXTCODESIZE/EXTCODEHASH/EXTCODECOPY, the target of any EIP-7702
+	// delegation the call invokes (executing a delegated account runs the target's
+	// code), and the address any CREATE/CREATE2 would deploy to (its prior occupancy
+	// is read for the collision check). Code/existence changes happen outside the
+	// storage trie, so a non-empty list also makes the result NOT storage-trackable
+	// (Trackable is false); watch these via kaia_subscribe("callResults") or poll.
+	CodeAddresses []common.Address `json:"codeAddresses,omitempty"`
+	// KeyAddresses are the accounts whose key the result depends on: the `from` of
+	// any validateSender precompile call, whose result reflects that account's key.
+	// A key changes on an AccountUpdate (outside the storage trie), so a non-empty
+	// list also makes the result NOT storage-trackable; watch these via
+	// kaia_subscribe("callResults") or poll.
+	KeyAddresses []common.Address `json:"keyAddresses,omitempty"`
 	// BlockContext lists the block-context opcodes the call used (e.g.
-	// TIMESTAMP, NUMBER, BASEFEE). When non-empty the result may change every
-	// block independently of state, so it cannot be tracked by watching state.
+	// TIMESTAMP, NUMBER, BASEFEE, and GASPRICE — which on Kaia defaults to
+	// baseFee*2). When non-empty the result may change every block independently
+	// of state, so it cannot be tracked by watching state.
 	BlockContext []string `json:"blockContext,omitempty"`
-	// Trackable is true iff the result is a pure function of tracked state
-	// (storage + balances) — i.e. BlockContext is empty. A reactive ("live")
-	// subscription on this call is only sound when Trackable is true.
-	Trackable bool `json:"trackable"`
+	// StorageTrackable is true iff this result can be kept live by watching the
+	// returned AccessList via kaia_subscribe("storageChanges") — i.e. it is a pure
+	// function of STORAGE: BlockContext, BalanceAddresses, CodeAddresses and
+	// KeyAddresses are all empty. A result that also depends on a balance,
+	// code/existence, or account key is NOT storage-trackable, because
+	// storageChanges observes only the storage trie; track such a call with
+	// kaia_subscribe("callResults"), which watches at account granularity, or poll.
+	//
+	// NOTE: this is a STRONGER predicate than the "trackable" field on a
+	// kaia_subscribe("callResults") snapshot, which is true whenever the result is a
+	// pure function of state (storage AND balance AND code AND key) and only false
+	// for block-context reads. A balance/code/key-dependent call is therefore
+	// storageTrackable=false here but trackable=true on a callResults snapshot. The
+	// two are deliberately named differently so the distinction is explicit on the
+	// wire: do not equate them when using this method to seed a callResults watch.
+	StorageTrackable bool `json:"storageTrackable"`
 	// Error is the raw VM error (e.g. "execution reverted"), if any.
 	Error string `json:"error,omitempty"`
 }
@@ -195,6 +226,12 @@ type CallWithAccessedStorageResult struct {
 // read or wrote during the call. It is the discovery counterpart to
 // kaia_subscribe("storageChanges"): run this once to learn which storage a call
 // depends on, then watch those contracts/slots.
+//
+// Check StorageTrackable before relying on that workflow: it is false when the
+// result also depends on an account balance (BalanceAddresses), account
+// code/existence (CodeAddresses), account key (KeyAddresses), or block context
+// (BlockContext) — none of which a storage-only watch can observe. Such calls must
+// use kaia_subscribe("callResults") (account granularity) or be polled.
 //
 // NOTE: This method is an unofficial, blockswords fork only method.
 func (s *KaiaBlockChainAPI) CallWithAccessedStorage(ctx context.Context, args CallArgs, blockNrOrHash rpc.BlockNumberOrHash) (*CallWithAccessedStorageResult, error) {
@@ -224,8 +261,15 @@ func (s *KaiaBlockChainAPI) CallWithAccessedStorage(ctx context.Context, args Ca
 		GasUsed:          hexutil.Uint64(result.UsedGas),
 		AccessList:       tracer.AccessList(),
 		BalanceAddresses: tracer.BalanceAddresses(),
+		CodeAddresses:    tracer.CodeAddresses(),
+		KeyAddresses:     tracer.KeyAddresses(),
 		BlockContext:     tracer.BlockContextOpcodes(),
-		Trackable:        tracer.Trackable(),
+		// StorageTrackable (not the weaker callResults "trackable"): the AccessList
+		// is meant to be fed to kaia_subscribe("storageChanges"), which watches the
+		// storage trie only and so cannot observe a balance (BalanceAddresses),
+		// code/existence (CodeAddresses) or account-key (KeyAddresses) dependency
+		// that can drift with no storage write.
+		StorageTrackable: tracer.StorageTrackable(),
 	}
 	if vmErr := result.Unwrap(); vmErr != nil {
 		res.Error = vmErr.Error()
