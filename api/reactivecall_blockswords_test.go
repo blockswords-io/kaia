@@ -138,9 +138,7 @@ func staticEval(mu *sync.Mutex, results map[uint64]string, deps map[common.Addre
 // mustSubscribe subscribes and fails the test on error.
 func mustSubscribe(t *testing.T, m *reactiveCallManager, args CallArgs, id rpc.ID) *reactiveCallSubscription {
 	t.Helper()
-	sub, err := m.subscribe(args, id)
-	require.NoError(t, err)
-	return sub
+	return m.subscribe(args, id)
 }
 
 // TestReactiveCallSnapshotUpdateDedup covers the core lifecycle: initial
@@ -848,4 +846,52 @@ func TestReactiveCallReevaluatesOnHeadJump(t *testing.T) {
 	assert.Equal(t, reactiveCallUpdate, upd.Type)
 	assert.EqualValues(t, 1, upd.Seq)
 	assert.Equal(t, "v4", string(upd.Result))
+}
+
+// TestReactiveCallArmedCapFallback verifies that a call whose accessed-account set
+// drifts without bound stops growing the armed set at reactiveMaxArmedDeps and
+// falls back to every-block re-evaluation (blockContextDep), staying correct via
+// re-read + dedup. Driven by calling evaluate() directly for determinism.
+func TestReactiveCallArmedCapFallback(t *testing.T) {
+	defer state.SetBlockswordsAccountWatchlist(nil)
+	prev := reactiveMaxArmedDeps
+	reactiveMaxArmedDeps = 3
+	defer func() { reactiveMaxArmedDeps = prev }()
+	capHitsBefore := reactiveArmedCapHits.Count()
+
+	// Each block reports a fresh dependency address, so the armed set grows by one
+	// per block until it hits the cap.
+	drift := func(ctx context.Context, args CallArgs, blockNum uint64) (*reactiveEvalResult, error) {
+		return &reactiveEvalResult{
+			returnData: []byte("constant"),
+			deps:       addrSet(common.BigToAddress(big.NewInt(int64(blockNum) + 1))),
+			trackable:  true,
+		}, nil
+	}
+	m, be := newReactiveTestManager(t, drift)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := &reactiveCallSubscription{
+		id:      1,
+		rpcID:   "drift",
+		mgr:     m,
+		out:     make(chan *CallResultNotification, reactiveCallBacklog),
+		trigger: make(chan struct{}, 1),
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+	m.mu.Lock()
+	m.subs[sub.id] = sub
+	m.mu.Unlock()
+
+	for n := uint64(1); n <= 8; n++ {
+		be.setHead(blockWithRoot(n, common.BigToHash(big.NewInt(int64(n)))))
+		sub.evaluate()
+	}
+
+	require.True(t, sub.armedCapped, "armed set must hit its cap and fall back")
+	require.True(t, sub.blockContextDep.Load(), "capped subscription re-evaluates every block")
+	require.LessOrEqual(t, len(sub.armed), reactiveMaxArmedDeps+1, "armed set is bounded near the cap")
+	require.Greater(t, reactiveArmedCapHits.Count(), capHitsBefore, "armed-cap metric incremented")
 }

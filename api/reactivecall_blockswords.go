@@ -76,7 +76,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"math/big"
 	"runtime"
 	"sync"
@@ -123,11 +122,6 @@ const (
 	// reactiveHeadBacklog bounds the shared chain-head channel.
 	reactiveHeadBacklog = 128
 
-	// reactiveMaxSubscriptions caps active reactive subscriptions node-wide.
-	// Each one can drive a full EVM re-evaluation per dependency change, so this
-	// guards a (trusted but careless) client from self-DoSing the node.
-	reactiveMaxSubscriptions = 1024
-
 	// reactiveDefaultGasCap bounds a single evaluation's gas when the node has
 	// no global RPC gas cap configured.
 	reactiveDefaultGasCap = 50_000_000
@@ -150,6 +144,33 @@ func reactiveEvalConcurrency() int {
 // loop hit its pass cap and fell back to self-healing. A persistently nonzero
 // rate points at calls whose dependency sets never stabilize.
 var reactiveStabilizationFallbacks = metrics.NewRegisteredCounter("kaia/reactivecall/stabilization/fallback", nil)
+
+// reactiveArmedCapHits counts subscriptions that hit reactiveMaxArmedDeps and fell
+// back to every-block re-evaluation. A persistently nonzero rate points at calls
+// whose accessed-account set drifts without bound.
+var reactiveArmedCapHits = metrics.NewRegisteredCounter("kaia/reactivecall/armed/capped", nil)
+
+var (
+	// reactiveSubsGauge tracks the number of active callResults subscriptions — the
+	// primary load signal for capacity/scale-out decisions. Each subscription can
+	// drive an EVM re-evaluation per block, so this is the key reactive-load metric.
+	reactiveSubsGauge = metrics.NewRegisteredGauge("kaia/reactivecall/subscriptions", nil)
+	// reactiveDropped counts notifications dropped because a consumer's buffer was
+	// full. The engine self-heals (re-attempts on the next block, no data loss), so
+	// a nonzero rate is a back-pressure / consumer-falling-behind signal, not loss.
+	reactiveDropped = metrics.NewRegisteredCounter("kaia/reactivecall/dropped", nil)
+)
+
+// reactiveMaxArmedDeps caps the monotonic per-subscription armed dependency set.
+// armed never narrows, so a call whose accessed-account set DRIFTS over time
+// (touching different accounts each block) would otherwise grow armed — and its
+// contribution to the global watch-list union — without bound, a slow memory creep
+// on a long-lived subscription. At the cap the engine stops watching precisely and
+// falls back to every-block re-evaluation (read current state + dedup), which stays
+// correct (any change is caught by the re-read) at the cost of one deduped EVM eval
+// per block, like a block-context call. Set well above any normal call's footprint;
+// it is a var only so tests can lower it.
+var reactiveMaxArmedDeps = 8192
 
 // CallResultNotification is one message of a callResults subscription.
 //
@@ -223,10 +244,7 @@ func (s *KaiaBlockChainAPI) CallResults(ctx context.Context, args CallArgs) (*rp
 	rpcSub := notifier.CreateSubscription()
 
 	mgr := reactiveCallManagerFor(s.b)
-	sub, err := mgr.subscribe(args, rpcSub.ID)
-	if err != nil {
-		return nil, err
-	}
+	sub := mgr.subscribe(args, rpcSub.ID)
 
 	go func() {
 		for {
@@ -303,6 +321,7 @@ type reactiveCallSubscription struct {
 	lastHash      common.Hash
 	seq           uint64
 	errorReported bool // the one-time pre-snapshot infra "error" message was already emitted
+	armedCapped   bool // armed hit reactiveMaxArmedDeps; now on the every-block path
 }
 
 func (sub *reactiveCallSubscription) loadDeps() map[common.Address]struct{} {
@@ -350,6 +369,7 @@ func (sub *reactiveCallSubscription) emit(n *CallResultNotification) bool {
 	case sub.out <- n:
 		return true
 	default:
+		reactiveDropped.Inc(1)
 		return false
 	}
 }
@@ -424,6 +444,26 @@ func (sub *reactiveCallSubscription) evaluate() {
 			return
 		}
 
+		// New dependencies appeared but the armed set has hit its ceiling: a call
+		// whose accessed-account set drifts would otherwise grow armed (and the
+		// global watch-list union) without bound. Stop growing and fall back to
+		// every-block re-evaluation — reading current state and deduping catches any
+		// change without watching it precisely. Publishing the current (subset-miss)
+		// result is sound: it reflects the head we just evaluated, and the every-block
+		// path re-confirms on the next block (arming-window close via needsReeval).
+		if len(sub.armed) >= reactiveMaxArmedDeps {
+			if !sub.armedCapped {
+				sub.armedCapped = true
+				sub.blockContextDep.Store(true) // force every-block re-evaluation
+				reactiveArmedCapHits.Inc(1)
+				logger.Warn("reactive call armed dependency set hit cap; falling back to every-block re-evaluation",
+					"subID", sub.id, "cap", reactiveMaxArmedDeps)
+			}
+			sub.publish(head, res)
+			sub.needsReeval.Store(true)
+			return
+		}
+
 		// New dependencies appeared: grow monotonically and re-confirm with the
 		// larger set armed before the next head read.
 		unionAddrInto(sub.armed, res.deps)
@@ -460,9 +500,14 @@ func (sub *reactiveCallSubscription) armDeps() {
 	if equalAddrSet(sub.armed, sub.published) {
 		return
 	}
-	sub.published = cloneAddrSet(sub.armed)
-	cp := cloneAddrSet(sub.armed)
-	sub.deps.Store(&cp)
+	// One immutable snapshot serves both the published-set comparison and the
+	// atomically-stored deps map: neither is mutated after assignment (published is
+	// only compared; the stored map is only iterated by the head loop and
+	// refreshWatchlist), while `armed` stays a separate mutable map for in-place
+	// unioning. This saves a redundant clone per dependency-set change.
+	snap := cloneAddrSet(sub.armed)
+	sub.published = snap
+	sub.deps.Store(&snap)
 	sub.mgr.refreshWatchlist()
 }
 
@@ -657,10 +702,28 @@ type reactiveCallManager struct {
 	running bool
 	quit    chan struct{}
 
+	// subsSnapshot is a lock-free copy of the subscription set, read by dispatch on
+	// the chain-head loop. dispatch therefore never takes m.mu, so a long
+	// refreshWatchlist rebuild during a subscribe burst can never starve the head
+	// loop — which matters because ChainHeadEvent is delivered synchronously on the
+	// block-import path (PostChainEvents), so a stalled head loop would back-pressure
+	// the feed and stall block import. Rebuilt under m.mu on every subs change.
+	subsSnapshot atomic.Pointer[[]*reactiveCallSubscription]
+
 	// lastDispatched is the number of the most recently dispatched head block. It is
 	// touched only by dispatch, which runs solely on the single head-loop goroutine,
 	// so it needs no synchronization. Used to detect a multi-block head jump.
 	lastDispatched uint64
+}
+
+// rebuildSubsSnapshotLocked refreshes the lock-free subscription snapshot read by
+// dispatch. Must hold m.mu.
+func (m *reactiveCallManager) rebuildSubsSnapshotLocked() {
+	snap := make([]*reactiveCallSubscription, 0, len(m.subs))
+	for _, sub := range m.subs {
+		snap = append(snap, sub)
+	}
+	m.subsSnapshot.Store(&snap)
 }
 
 var (
@@ -679,14 +742,9 @@ func reactiveCallManagerFor(b Backend) *reactiveCallManager {
 	return reactiveCallManagerInst
 }
 
-func (m *reactiveCallManager) subscribe(args CallArgs, rpcID rpc.ID) (*reactiveCallSubscription, error) {
+func (m *reactiveCallManager) subscribe(args CallArgs, rpcID rpc.ID) *reactiveCallSubscription {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
-	if len(m.subs) >= reactiveMaxSubscriptions {
-		m.mu.Unlock()
-		cancel()
-		return nil, fmt.Errorf("callResults: too many active subscriptions (max %d)", reactiveMaxSubscriptions)
-	}
 	m.nextID++
 	sub := &reactiveCallSubscription{
 		id:      m.nextID,
@@ -699,13 +757,15 @@ func (m *reactiveCallManager) subscribe(args CallArgs, rpcID rpc.ID) (*reactiveC
 		cancel:  cancel,
 	}
 	m.subs[sub.id] = sub
+	m.rebuildSubsSnapshotLocked()
+	reactiveSubsGauge.Update(int64(len(m.subs)))
 	if !m.running {
 		m.startLocked() // start once; the head loop runs for the manager's lifetime
 	}
 	m.mu.Unlock()
 
 	go sub.run()
-	return sub, nil
+	return sub
 }
 
 func (m *reactiveCallManager) unsubscribe(sub *reactiveCallSubscription) {
@@ -715,6 +775,8 @@ func (m *reactiveCallManager) unsubscribe(sub *reactiveCallSubscription) {
 		return
 	}
 	delete(m.subs, sub.id)
+	m.rebuildSubsSnapshotLocked()
+	reactiveSubsGauge.Update(int64(len(m.subs)))
 	m.mu.Unlock()
 
 	sub.cancel()         // stop the eval goroutine and abort any in-flight call
@@ -723,6 +785,17 @@ func (m *reactiveCallManager) unsubscribe(sub *reactiveCallSubscription) {
 
 // refreshWatchlist recomputes the union of every subscription's dependency
 // accounts and pushes it to the state-layer account capture gate.
+//
+// Cost: O(S·D) in the active subscription count S and per-sub dependency count D,
+// run under m.mu whenever a subscription's dependency set changes (subscribe and
+// dependency drift; NOT per block, and not once a sub's deps stabilize). With
+// subscriptions uncapped this can spike during a large simultaneous subscribe
+// burst, but it is bounded by CPU and m.mu only — it can NOT stall block import,
+// because dispatch reads subscriptions via the lock-free subsSnapshot and never
+// waits on m.mu (see dispatch / subsSnapshot). This matches the fork's deployment
+// model (internal traffic, scale out on CPU/memory). A per-address refcount could
+// make it incremental, but is deliberately not used here: the full build+publish
+// under one lock is what makes the watch-list race-free (see below).
 func (m *reactiveCallManager) refreshWatchlist() {
 	// Build AND publish the union under the lock. Publishing outside the lock would
 	// race: a stale union (snapshotted before another goroutine armed a new dep)
@@ -822,12 +895,16 @@ func (m *reactiveCallManager) dispatch(block *types.Block) {
 		}
 	}
 
-	m.mu.Lock()
-	subs := make([]*reactiveCallSubscription, 0, len(m.subs))
-	for _, sub := range m.subs {
-		subs = append(subs, sub)
+	// Read the subscription set lock-free: dispatch must never block on m.mu, or a
+	// long refreshWatchlist rebuild during a subscribe burst could stall the head
+	// loop and back-pressure the (block-import-critical) ChainHeadEvent feed. A
+	// momentarily stale snapshot is harmless: signalling a just-removed sub is a
+	// no-op (its trigger is a never-read token), and a just-added sub already runs
+	// its own initial evaluation and is picked up on the next block.
+	var subs []*reactiveCallSubscription
+	if p := m.subsSnapshot.Load(); p != nil {
+		subs = *p
 	}
-	m.mu.Unlock()
 
 	for _, sub := range subs {
 		// Signal a subscription when:

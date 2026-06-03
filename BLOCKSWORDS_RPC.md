@@ -1,22 +1,42 @@
 # Blockswords RPC reference
 
-Fork-only JSON-RPC methods added by the `blockswords` fork for indexing/state
-monitoring. All methods live on the `KaiaBlockChainAPI` service and are therefore
-exposed under the **`kaia`**, **`klay`**, and **`eth`** namespaces (examples below
-use `kaia`).
+Fork-only JSON-RPC methods added by the `blockswords` fork for indexing / state
+monitoring. Methods live on the `KaiaBlockChainAPI` service (the **`kaia`**
+namespace) and the `DebugCNAPI` service (the **`debug`** namespace). Examples use
+`kaia` / `debug`.
 
-| Method | Kind | Transport |
-|---|---|---|
-| [`kaia_callWithAccessedStorage`](#kaia_callwithaccessedstorage) | request/response | HTTP, WS, IPC |
-| [`kaia_subscribe("storageChanges", …)`](#kaia_subscribestoragechanges-filters) | subscription | WS, IPC |
-| [`kaia_subscribe("callResults", …)`](#kaia_subscribecallresults-callargs) | subscription | WS, IPC |
-| [`kaia_callResultSubscriptions`](#kaia_callresultsubscriptions) | request/response | HTTP, WS, IPC |
+## Method index
+
+| Method | Namespace | Kind | Status |
+|---|---|---|---|
+| [`kaia_subscribe("storageChanges", …)`](#kaia_subscribestoragechanges-filters) | `kaia` | subscription (WS/IPC) | **Active** |
+| [`kaia_subscribe("callResults", …)`](#kaia_subscribecallresults-callargs) | `kaia` | subscription (WS/IPC) | **Active** |
+| [`kaia_callResultSubscriptions`](#kaia_callresultsubscriptions) | `kaia` | request/response | **Active** |
+| [`kaia_getStoragesAt`](#kaia_getstoragesat) | `kaia` | request/response | **Active** |
+| [`kaia_estimateGasWithTrace`](#kaia_estimategaswithtrace) | `kaia` | request/response | **Active** |
+| [`kaia_callWithAccessedStorage`](#kaia_callwithaccessedstorage) | `kaia` | request/response | ⚠️ **Deprecated** |
+| [`kaia_registerStorageKeys`](#kaia_registerstoragekeys) | `kaia` | request/response | ⚠️ **Deprecated** |
+| [`kaia_registeredStorageKeyHashes`](#kaia_registeredstoragekeyhashes) | `kaia` | request/response | ⚠️ **Deprecated** |
+| [`kaia_unregisterStorageKeyHash`](#kaia_unregisterstoragekeyhash) | `kaia` | request/response | ⚠️ **Deprecated** |
+| [`kaia_getRegisteredStoragesAt`](#kaia_getregisteredstoragesat) | `kaia` | request/response | ⚠️ **Deprecated** |
+| [`debug_dumpContractStorage`](#debug_dumpcontractstorage) | `debug` | request/response | ⚠️ **Deprecated** |
+| [`debug_dumpContractStorageHash`](#debug_dumpcontractstoragehash) | `debug` | request/response | ⚠️ **Deprecated** |
+| [`debug_diffContractStorageHash`](#debug_diffcontractstoragehash) | `debug` | request/response | ⚠️ **Deprecated** |
+
+## Deprecation notice
+
+The fork is consolidating on the two subscriptions — **`storageChanges`** and
+**`callResults`** — plus **`kaia_getStoragesAt`** for cold-start snapshots. The
+**polling / discovery** methods marked ⚠️ **Deprecated** above are being phased out
+and will be removed; client logic is migrating to rely solely on the two
+subscriptions. The deprecated methods still function unchanged for now — **do not
+build new integrations on them.** (`kaia_estimateGasWithTrace` is a separate
+debugging aid and is **not** deprecated.)
 
 **General notes**
 
 - Subscriptions require **WebSocket or IPC**; over HTTP they return
-  `notifications not supported`. Enable the `kaia` (and/or `eth`) module on the WS
-  endpoint.
+  `notifications not supported`. Enable the `kaia` module on the WS endpoint.
 - Capture is **gated by a lock-free atomic watch-list and is a no-op when no
   subscription is active** — the methods add no measurable cost to block import
   when unused.
@@ -27,6 +47,11 @@ use `kaia`).
 ---
 
 ## `kaia_callWithAccessedStorage`
+
+> ⚠️ **Deprecated** — being removed. For keeping a call's result live use
+> [`kaia_subscribe("callResults")`](#kaia_subscribecallresults-callargs); to learn
+> which storage a call touches (to drive a `storageChanges` watch), this method's
+> `accessList` is the discovery tool, but new integrations should subscribe directly.
 
 Executes a call exactly like `kaia_call`, and additionally reports the
 **dependencies** the call touched: accessed storage slots, balance reads, and any
@@ -173,8 +198,17 @@ removes the snapshot/subscribe gap.
 
 - **Known limitation:** a `SELFDESTRUCT`-driven storage wipe is **not** reported.
   Do not use `storageChanges` for contracts that may self-destruct.
-- On a `seq` gap or disconnect, resync via `debug_diffContractStorageHash` from
-  your last block, then resubscribe.
+- On a `seq` gap or disconnect, **resync by resubscribing**: the new subscription
+  delivers a fresh `ready` anchor, re-take the cold-start snapshot at that block via
+  [`kaia_getStoragesAt`](#kaia_getstoragesat), then resume. (The deprecated
+  `debug_diffContractStorageHash` can diff your last block → head as a transitional
+  shortcut, but it is being removed.)
+- **Re-anchor on a head jump:** if the node imports several blocks at once (a batch
+  insert emits a single head event that skips blocks), the server re-emits a
+  `ready` frame at the new head and `seq` restarts at 1. Treat a `ready` received
+  mid-stream exactly like the initial one: re-take the cold-start snapshot pinned at
+  its `blockNumber`, then resume applying `changes`. This guarantees the skipped
+  blocks' changes are never lost silently (they are covered by the new snapshot).
 
 ---
 
@@ -300,7 +334,6 @@ result, same generic error) and are **not** re-emitted.
   node hiccup is not mistaken for the call reverting.
 - Errors:
   - `notifications not supported` — called over HTTP.
-  - `callResults: too many active subscriptions (max 1024)` — global cap reached.
 - A single evaluation is bounded by `RPCEVMTimeout` and by the node's RPC gas cap
   (or a **50,000,000-gas fallback** when no `--rpc.gascap` is set).
 
@@ -335,6 +368,85 @@ None.
 
 ---
 
+## `kaia_getStoragesAt`
+
+Reads specific storage slots of a contract at a given block. This is the
+recommended way to take a `storageChanges` **cold-start snapshot**: read the watched
+slots pinned at the anchor block `H` from the `ready` frame.
+
+### Parameters
+
+1. `address` — `Address`. Contract.
+2. `keys` — `Array<Hash>`. Storage slots to read.
+3. `blockNumberOrHash` — `String` | `Object`. `"latest"`, a hex block number, or
+   `{ "blockHash": "0x…" }`. For a snapshot, pass the anchor block `H` — never
+   `"latest"`.
+
+### Returns
+
+`Object` mapping each requested slot to its value: `{ "0x<key>": "0x<value>", … }`.
+A slot whose value is **zero is omitted**, so a missing key means an empty slot.
+
+### Example
+
+```json
+// request
+{ "jsonrpc":"2.0", "id":1, "method":"kaia_getStoragesAt",
+  "params":[ "0xPair", ["0x8","0x9"], "0x12a0c4" ] }
+// response
+{ "jsonrpc":"2.0", "id":1, "result": { "0x8":"0x…aaa", "0x9":"0x…bbb" } }
+```
+
+### Notes
+
+- Honours `"latest"`/`"pending"` meta-blocks, a hex number, or a block hash.
+- Reads are **independent of `--snapshot`**.
+- A **non-existent contract** is not an error — it returns an empty object `{}`.
+- **Errors:** an unknown/unresolvable block (or a state read error) returns a
+  JSON-RPC error rather than a result.
+
+---
+
+## `kaia_estimateGasWithTrace`
+
+Like `kaia_estimateGas`, but when estimation **fails** (the call would revert) it
+additionally re-runs the call with an internal-transaction tracer and returns the
+trace, to help debug *why* it reverts. A debugging aid — **not** part of the
+storage-monitoring flow and **not** deprecated.
+
+### Parameters
+
+1. `callArgs` — `Object`. Same as `kaia_call` (see [CallArgs](#callargs)). Evaluated
+   at the **latest** block.
+
+### Returns
+
+`Object`:
+
+| field | type | description |
+|---|---|---|
+| `gas` | `Quantity` | Estimated gas. On success this is the only field present. |
+| `trace` | `Object` | Internal-transaction trace of the failing call. Present **only** when estimation failed (the call is re-run at the upper gas limit with the tracer). |
+| `error` | `String` | The raw VM error from the failed estimation. Present **only** on failure. |
+
+### Example
+
+```json
+// success
+{ "jsonrpc":"2.0", "id":1, "result": { "gas":"0x5208" } }
+// failure (would revert)
+{ "jsonrpc":"2.0", "id":1, "result": {
+  "gas":"0x0", "error":"execution reverted", "trace": { /* internal-tx trace */ } } }
+```
+
+### Notes
+
+- The `{ gas, error, trace }` object is the **normal** failure shape. The call can
+  still return a top-level JSON-RPC **error** (not a result object) if the request
+  context is cancelled/timed out, or if the internal-tx tracer itself fails.
+
+---
+
 ## Managing subscriptions (list & unsubscribe)
 
 Both subscription types (`storageChanges`, `callResults`) use the standard
@@ -351,8 +463,7 @@ unsubscribe and to correlate notifications.
 
 Send `kaia_unsubscribe(<id>)` on the **same connection** that created the
 subscription. Returns `true` if the subscription existed and was removed. This is
-the built-in RPC mechanism and works under whichever namespace you subscribed
-(`kaia`/`klay`/`eth`).
+the built-in RPC mechanism and works under the `kaia` namespace you subscribed on.
 
 ```json
 { "jsonrpc":"2.0", "id":2, "method":"kaia_unsubscribe", "params":["0x4f1…"] }
@@ -366,8 +477,7 @@ entries) are released. A cleanly disconnected client leaks nothing. A client tha
 that exceeds the write deadline (default 10s) tears the subscription down. For a
 client that is stuck but neither reading nor closing the socket, enable the
 WebSocket **read** deadline (`--wsreaddeadline`, disabled by default) so the
-connection is detected and closed; the per-node `callResults` cap (1024) bounds the
-blast radius regardless.
+connection is detected and closed.
 
 ### Listing
 
@@ -381,6 +491,163 @@ blast radius regardless.
 
 In all cases the client already holds its ids from the subscribe responses, so a
 server-side list is an introspection/ops convenience rather than a requirement.
+
+---
+
+## `kaia_registerStorageKeys`
+
+> ⚠️ **Deprecated** — being removed. Pass slots inline to
+> [`kaia_getStoragesAt`](#kaia_getstoragesat), or watch them with
+> [`kaia_subscribe("storageChanges")`](#kaia_subscribestoragechanges-filters).
+
+Registers a set of storage keys under a content hash, so you can later read them by
+hash (via [`kaia_getRegisteredStoragesAt`](#kaia_getregisteredstoragesat)) without
+resending the full list.
+
+### Parameters
+
+1. `keys` — `Array<Hash>`. The storage slots to register as a set.
+
+### Returns
+
+`Boolean` — always `true`. The set is stored under `keccak256(key₁ ‖ key₂ ‖ …)`
+(the keys concatenated, in order). Re-registering the same set is **idempotent**.
+Compute the same hash client-side to reference the set later.
+
+---
+
+## `kaia_registeredStorageKeyHashes`
+
+> ⚠️ **Deprecated** — being removed (companion to `kaia_registerStorageKeys`).
+
+Returns the content hashes of all currently registered key-sets.
+
+### Parameters
+
+None.
+
+### Returns
+
+`Array<Hash>` — one hash per registered key-set.
+
+---
+
+## `kaia_unregisterStorageKeyHash`
+
+> ⚠️ **Deprecated** — being removed (companion to `kaia_registerStorageKeys`).
+
+Removes a registered key-set by its content hash.
+
+### Parameters
+
+1. `hash` — `Hash`. The content hash returned/derived from `kaia_registerStorageKeys`.
+
+### Returns
+
+`Boolean` — `true` (idempotent; `true` even if the hash was not registered).
+
+---
+
+## `kaia_getRegisteredStoragesAt`
+
+> ⚠️ **Deprecated** — being removed. Use [`kaia_getStoragesAt`](#kaia_getstoragesat)
+> with the slots passed inline.
+
+Like [`kaia_getStoragesAt`](#kaia_getstoragesat), but the slot list is supplied as a
+previously-[registered](#kaia_registerstoragekeys) content hash instead of inline.
+
+### Parameters
+
+1. `address` — `Address`. Contract.
+2. `hash` — `Hash`. A registered key-set hash.
+3. `blockNumberOrHash` — `String` | `Object`. `"latest"`, a hex number, or
+   `{ "blockHash": "0x…" }`.
+
+### Returns
+
+`Object` mapping each slot in the registered set to its value (zero-valued slots
+omitted) — identical shape to `kaia_getStoragesAt`.
+
+### Errors
+
+- `storage keys not found` — the hash is not registered.
+
+---
+
+## `debug_dumpContractStorage`
+
+> ⚠️ **Deprecated** — being removed. To follow a contract's storage use
+> [`kaia_subscribe("storageChanges")`](#kaia_subscribestoragechanges-filters); for a
+> point-in-time read use [`kaia_getStoragesAt`](#kaia_getstoragesat).
+
+Returns the **entire** storage (every slot) of each given contract at a block, with
+**preimage-resolved** keys where available.
+
+### Parameters
+
+1. `addresses` — `Array<Address>`. Contracts to dump.
+2. `blockNumberOrHash` — `String` | `Object`.
+
+### Returns
+
+`Object`: `{ "<address>": { "<key>": "<value>", … }, … }`. Each key is the resolved
+slot (hex), or `"hash:<hashed-slot>"` when the preimage is unavailable; values are
+hex.
+
+### Notes
+
+- **Expensive and unbounded:** it walks the full storage trie of each contract (no
+  pagination). Iteration is cancellable via the request context/timeout.
+- An address with **no storage** (an EOA or unknown account) returns an empty object
+  `{}` for that address rather than an error.
+
+---
+
+## `debug_dumpContractStorageHash`
+
+> ⚠️ **Deprecated** — being removed (see `debug_dumpContractStorage`).
+
+Same as [`debug_dumpContractStorage`](#debug_dumpcontractstorage) but with **hashed**
+storage-trie keys — it skips preimage resolution for lower latency. Each key is
+`"hash:<hashed-slot>"`.
+
+### Parameters / Returns
+
+Identical to `debug_dumpContractStorage`, except keys are always the hashed slot.
+
+---
+
+## `debug_diffContractStorageHash`
+
+> ⚠️ **Deprecated** — being removed. Track per-block changes with
+> [`kaia_subscribe("storageChanges")`](#kaia_subscribestoragechanges-filters); resync
+> by resubscribing + [`kaia_getStoragesAt`](#kaia_getstoragesat).
+
+Returns the storage entries that **changed** for each contract between two blocks,
+using hashed keys.
+
+### Parameters
+
+1. `addresses` — `Array<Address>`. Contracts to diff.
+2. `fromBlock` — `String` | `Object`. Lower block (exclusive baseline).
+3. `toBlock` — `String` | `Object` | `null`. Upper block; `null` ⇒ `"latest"`.
+4. `includeDeletions` — `Boolean` (optional). When `true`, slots cleared between the
+   two blocks are included with a `null` value.
+
+### Returns
+
+`Object`:
+
+| field | type | description |
+|---|---|---|
+| `fromBlock` | `Quantity` | Resolved from-block number. |
+| `toBlock` | `Quantity` | Resolved to-block number. |
+| `storage` | `Object` | `{ "<address>": { "hash:<slot>": "<value>" \| null }, … }`. A `null` value means the slot was deleted (only present when `includeDeletions` is `true`). |
+
+### Errors
+
+- `from block height (X) must be less than to block height (Y)` — `fromBlock` must be
+  strictly below `toBlock`.
 
 ---
 
@@ -416,18 +683,56 @@ The standard `kaia_call`/`eth_call` argument object. Common fields:
 
 ---
 
+## Metrics
+
+The fork exports the following [go-metrics](https://github.com/rcrowley/go-metrics)
+series. They are registered under the names below; how they appear on your metrics
+endpoint depends on the exporter (e.g. Prometheus renders
+`kaia/reactivecall/subscriptions` as `kaia_reactivecall_subscriptions`). All series
+sit at **zero when the fork is idle** (capture/evaluation is a no-op with no
+subscriptions).
+
+### `callResults`
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `kaia/reactivecall/subscriptions` | Gauge | Active `callResults` subscriptions node-wide. **Primary load signal** — each can drive an EVM re-evaluation per block. |
+| `kaia/reactivecall/dropped` | Counter | Notifications dropped because a consumer's buffer was full. The engine **self-heals** (re-attempts next block; no data loss), so a rising rate is a **back-pressure / consumer-falling-behind** signal, not loss. |
+| `kaia/reactivecall/stabilization/fallback` | Counter | Times a subscription's initial dependency-growth loop hit its pass cap and fell back to self-healing. A persistently rising rate points at a call whose dependency set never stabilizes. |
+| `kaia/reactivecall/armed/capped` | Counter | Subscriptions whose watched-dependency set hit its size cap and fell back to **every-block re-evaluation** (still correct, but extra CPU per such sub). A rising rate points at calls whose accessed-account set drifts without bound. |
+
+### `storageChanges`
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `kaia/storagewatch/subscriptions` | Gauge | Active `storageChanges` subscriptions node-wide. **Primary load signal.** |
+| `kaia/storagewatch/dropped` | Counter | Change notifications dropped because a consumer's buffer was full. Each drop is a `seq` gap the client must resync — a rising rate signals **consumers falling behind** / node overload. |
+
+### Using them
+
+- **Scale-out trigger:** watch the two `subscriptions` gauges alongside node CPU/RSS —
+  this fork is sized to scale out horizontally under load rather than cap subscriptions.
+- **Degradation:** a sustained nonzero `dropped` rate (either subsystem) means consumers
+  can't keep up — they will be forced to resync (`storageChanges`) or re-converge
+  (`callResults`); investigate consumer throughput or scale out.
+
+---
+
 ## Operational notes
 
 - **Transports:** subscriptions require WS/IPC. `unsubscribe` via
   `kaia_unsubscribe(<id>)`; notifications arrive as `kaia_subscription`.
-- **Limits:** at most **1024** concurrent `callResults` subscriptions node-wide;
-  concurrent EVM evaluations are bounded by a CPU-count semaphore so reactive load
-  cannot stall block processing.
+- **Limits:** the number of concurrent subscriptions is **not** capped (this fork
+  serves internal traffic and scales out on CPU/memory pressure). Concurrent EVM
+  evaluations are bounded by a CPU-count semaphore so reactive load cannot stall
+  block processing regardless of how many subscriptions are active. Monitor load and
+  consumer health via the exported [Metrics](#metrics).
 - **Finality:** delivery is tied to the canonical `ChainHeadEvent`; the design
   assumes Kaia's immediate finality (no multi-block reorgs) and emits no
   rollback events.
 - **Sequence numbers** (`seq`): for `storageChanges`, `seq` may gap on a slow
-  connection (a dropped delta) — on a gap, resync via
-  `debug_diffContractStorageHash`. For `callResults`, `seq` is contiguous: a send
-  dropped while your buffer is full is re-attempted on the next block, so you
-  converge to the current result without resyncing.
+  connection (a dropped delta) and resets on a head-jump re-anchor — on either,
+  resync by **resubscribing** and re-snapshotting at the new `ready` anchor via
+  `kaia_getStoragesAt`. For `callResults`, `seq` is contiguous: a send dropped while
+  your buffer is full is re-attempted on the next block, so you converge to the
+  current result without resyncing.

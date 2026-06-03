@@ -30,6 +30,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kaiachain/kaia/blockchain"
 	"github.com/kaiachain/kaia/blockchain/state"
@@ -37,6 +38,17 @@ import (
 	"github.com/kaiachain/kaia/common"
 	"github.com/kaiachain/kaia/common/hexutil"
 	"github.com/kaiachain/kaia/networks/rpc"
+	"github.com/rcrowley/go-metrics"
+)
+
+var (
+	// storageWatchSubsGauge tracks the number of active storageChanges
+	// subscriptions — the primary load signal for capacity/scale-out decisions.
+	storageWatchSubsGauge = metrics.NewRegisteredGauge("kaia/storagewatch/subscriptions", nil)
+	// storageWatchDropped counts change notifications dropped because a consumer's
+	// buffer was full. A nonzero rate means consumers are falling behind (each drop
+	// is a seq gap the client must resync) — a node-overload / scale-out signal.
+	storageWatchDropped = metrics.NewRegisteredCounter("kaia/storagewatch/dropped", nil)
 )
 
 // StorageWatchFilter selects which storage changes a subscription receives.
@@ -204,16 +216,20 @@ func (sub *storageWatchSubscription) match(c state.BlockswordsStorageChange) boo
 	return ok
 }
 
-// emit performs a non-blocking send. A full buffer means the consumer fell
-// behind; the message is dropped (the already-advanced seq exposes the gap) and
-// the subscription stays alive so the consumer can resync rather than being
-// force-closed. We never block here: blocking would stall delivery to other
-// subscribers and back-pressure the chain-head feed. The "ready" frame is the
-// first send to a fresh, empty buffer, so it cannot be dropped.
-func (sub *storageWatchSubscription) emit(n *StorageChangeNotification) {
+// emit performs a non-blocking send and reports whether it was delivered. A full
+// buffer means the consumer fell behind; for a "changes" frame the message is
+// dropped (the already-advanced seq exposes the gap) and the subscription stays
+// alive so the consumer can resync rather than being force-closed. We never block
+// here: blocking would stall delivery to other subscribers and back-pressure the
+// chain-head feed. The caller uses the return value for the "ready" frame, which
+// must not be lost (see dispatch): on a drop the (re-)anchor is retried next block.
+func (sub *storageWatchSubscription) emit(n *StorageChangeNotification) bool {
 	select {
 	case sub.ch <- n:
+		return true
 	default:
+		storageWatchDropped.Inc(1)
+		return false
 	}
 }
 
@@ -228,6 +244,29 @@ type storageWatchManager struct {
 	nextID  uint64
 	running bool
 	quit    chan struct{}
+
+	// subsSnapshot is a lock-free copy of the subscription set, read by dispatch on
+	// the chain-head loop, so dispatch never takes m.mu. ChainHeadEvent is delivered
+	// synchronously on the block-import path (PostChainEvents), so a head loop that
+	// blocked on m.mu (e.g. behind a refreshWatchlistLocked rebuild during a
+	// subscribe burst) would back-pressure the feed and stall block import. Rebuilt
+	// under m.mu on every subs change.
+	subsSnapshot atomic.Pointer[[]*storageWatchSubscription]
+
+	// lastDispatched is the number of the most recently dispatched head block. It
+	// is touched only by the single dispatch goroutine, so it needs no
+	// synchronization. Used to detect a multi-block head jump (batch insert).
+	lastDispatched uint64
+}
+
+// rebuildSubsSnapshotLocked refreshes the lock-free subscription snapshot read by
+// dispatch. Must hold m.mu.
+func (m *storageWatchManager) rebuildSubsSnapshotLocked() {
+	snap := make([]*storageWatchSubscription, 0, len(m.subs))
+	for _, sub := range m.subs {
+		snap = append(snap, sub)
+	}
+	m.subsSnapshot.Store(&snap)
 }
 
 var (
@@ -256,6 +295,8 @@ func (m *storageWatchManager) subscribe(filters map[common.Address]map[common.Ha
 		ch:      make(chan *StorageChangeNotification, storageWatchBacklog),
 	}
 	m.subs[sub.id] = sub
+	m.rebuildSubsSnapshotLocked()
+	storageWatchSubsGauge.Update(int64(len(m.subs)))
 	m.refreshWatchlistLocked()
 	if !m.running {
 		m.startLocked()
@@ -271,8 +312,24 @@ func (m *storageWatchManager) unsubscribe(sub *storageWatchSubscription) {
 		return
 	}
 	delete(m.subs, sub.id)
+	m.rebuildSubsSnapshotLocked()
+	storageWatchSubsGauge.Update(int64(len(m.subs)))
 	m.refreshWatchlistLocked()
-	if len(m.subs) == 0 && m.running {
+	// The head loop is deliberately NOT stopped on last-unsubscribe. Stopping and
+	// later restarting it would let the dying goroutine and a fresh one briefly
+	// contend for the same delete-on-read per-block delta — the exact restart race
+	// the reactive manager documents avoiding (see reactivecall startLocked). With
+	// no subscriptions the watch-list is empty, so capture is a no-op and the loop
+	// idles cheaply (LookupBlockswordsStorageChanges returns nil). close() stops it
+	// for test cleanup only.
+}
+
+// close stops the chain-head loop. It is intended for test cleanup; production
+// uses the process-lifetime singleton and never calls it.
+func (m *storageWatchManager) close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running {
 		m.running = false
 		close(m.quit)
 	}
@@ -282,6 +339,12 @@ func (m *storageWatchManager) unsubscribe(sub *storageWatchSubscription) {
 // (addr -> slot-set, nil set = all slots) and pushes it to the state-layer
 // capture gate, so writes to slots no subscription cares about are skipped at
 // capture time rather than buffered and filtered later. Must hold m.mu.
+//
+// Cost: O(S·F) in subscription count S and per-sub filter count F, on subscribe/
+// unsubscribe only. With subscriptions uncapped this can spike during a large
+// simultaneous subscribe burst, but it is bounded by CPU and m.mu and can NOT
+// stall block import — dispatch reads subscriptions via the lock-free subsSnapshot
+// and never waits on m.mu. This matches the fork's scale-out-on-CPU model.
 func (m *storageWatchManager) refreshWatchlistLocked() {
 	union := make(map[common.Address]map[common.Hash]struct{})
 	for _, sub := range m.subs {
@@ -332,32 +395,65 @@ func (m *storageWatchManager) startLocked() {
 // dispatch joins the captured delta for the new canonical head against the
 // active subscriptions and delivers each its matching, filtered changes.
 func (m *storageWatchManager) dispatch(block *types.Block) {
+	number64 := block.NumberU64()
+	// Detect a batch-insert head jump. A normal live insert advances the head one
+	// block at a time (one ChainHeadEvent per block); a batch insert commits several
+	// blocks but emits a single ChainHeadEvent for the last, so the per-root deltas of
+	// the skipped blocks are never joined here. Silently delivering only the head's
+	// delta would advance seq with no gap, hiding the skipped blocks from the client
+	// and violating the no-silent-gap contract. Instead, re-anchor every affected
+	// subscription below (a fresh "ready" so the client re-snapshots at the new head,
+	// whose state already reflects the skipped blocks' cumulative effect, then resumes
+	// the delta stream strictly after). lastDispatched is owned solely by this single
+	// dispatch goroutine, so it needs no synchronization; it starts at zero (no real
+	// block is 0) so the first dispatch is never treated as a jump.
+	jumped := m.lastDispatched != 0 && number64 > m.lastDispatched+1
+	m.lastDispatched = number64
+
 	changes := state.LookupBlockswordsStorageChanges(block.Root())
 
-	m.mu.Lock()
-	subs := make([]*storageWatchSubscription, 0, len(m.subs))
-	for _, sub := range m.subs {
-		subs = append(subs, sub)
+	// Read the subscription set lock-free: dispatch must never block on m.mu, or a
+	// long refreshWatchlistLocked rebuild during a subscribe burst could stall the
+	// head loop and back-pressure the (block-import-critical) ChainHeadEvent feed.
+	// dispatch is the only writer of each sub's anchored/seq, and runs solely on the
+	// single head-loop goroutine, so a momentarily stale snapshot is harmless.
+	var subs []*storageWatchSubscription
+	if p := m.subsSnapshot.Load(); p != nil {
+		subs = *p
 	}
-	m.mu.Unlock()
 
-	number := hexutil.Uint64(block.NumberU64())
+	number := hexutil.Uint64(number64)
 	hash := block.Hash()
 	for _, sub := range subs {
-		// Anchor a fresh subscription on the first head it observes: emit a
-		// "ready" frame naming this block and skip this block's changes. The
-		// consumer snapshots pinned at this block, and we then deliver every
-		// strictly-later block — no gap, no overlap. This block's own capture
-		// may be partial (it could have been mid-commit when the watch-list
-		// activated), which is exactly why we exclude it from the delta stream
-		// and let the consumer's snapshot cover it.
+		// On a head jump, re-anchor an already-anchored subscription: drop it back to
+		// un-anchored so the branch below re-emits a "ready" and the client
+		// re-snapshots, rather than missing the skipped blocks' changes.
+		if jumped && sub.anchored {
+			sub.anchored = false
+		}
+		// Anchor a fresh (or re-anchoring) subscription: emit a "ready" frame naming
+		// this block and skip this block's changes. The consumer snapshots pinned at
+		// this block, and we then deliver every strictly-later block — no gap, no
+		// overlap. This block's own capture may be partial (mid-commit when the
+		// watch-list activated), which is why we exclude it from the delta stream.
+		//
+		// The "ready" must reach the client (it is the resync signal). Unlike the
+		// initial anchor — a guaranteed-deliverable send to a fresh, empty buffer — a
+		// RE-anchor can hit a full buffer (a slow consumer is exactly what makes a head
+		// jump likely). So flip anchored (and reset seq) only when the ready was
+		// actually delivered; on a drop the subscription stays un-anchored and the next
+		// dispatch re-attempts the ready at the then-current head, mirroring the
+		// reactive engine's emit→retry self-heal. This keeps the no-silent-gap
+		// guarantee: a re-snapshot signal is never lost, only deferred until it lands.
 		if !sub.anchored {
-			sub.anchored = true
-			sub.emit(&StorageChangeNotification{
+			if sub.emit(&StorageChangeNotification{
 				Type:        StorageWatchReady,
 				BlockNumber: number,
 				BlockHash:   hash,
-			})
+			}) {
+				sub.anchored = true
+				sub.seq = 0
+			}
 			continue
 		}
 		if len(changes) == 0 {
